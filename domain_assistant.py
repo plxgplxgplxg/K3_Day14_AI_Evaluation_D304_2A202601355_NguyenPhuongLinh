@@ -242,28 +242,48 @@ class TextGenerator(Protocol):
     def generate(self, prompt: str) -> str: ...
 
 
-class OpenAIGenerator:
-    def __init__(self, max_output_tokens: int = 300) -> None:
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        self.model = os.getenv("OPENAI_MODEL", "").strip()
+class OpenRouterGenerator:
+    def __init__(
+        self,
+        max_output_tokens: int = 300,
+        max_retries: int = 3,
+        retry_delay_seconds: float = 1.0,
+    ) -> None:
+        api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+        self.model = os.getenv("OPENROUTER_MODEL", "").strip()
         if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing from .env")
+            raise RuntimeError("OPENROUTER_API_KEY is missing from .env")
         if not self.model:
-            raise RuntimeError("OPENAI_MODEL is missing from .env")
-        self.client = OpenAI(api_key=api_key)
+            raise RuntimeError("OPENROUTER_MODEL is missing from .env")
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://openrouter.ai/api/v1",
+        )
         self.max_output_tokens = max_output_tokens
+        self.max_retries = max_retries
+        self.retry_delay_seconds = retry_delay_seconds
 
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
-        answer = response.output_text.strip()
-        if not answer:
-            raise RuntimeError("OpenAI returned an empty answer")
-        return answer
+        last_error: RuntimeError | None = None
+        for attempt in range(1, self.max_retries + 1):
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=self.max_output_tokens,
+            )
+            answer = (response.choices[0].message.content or "").strip()
+            if answer:
+                return answer
+            last_error = RuntimeError(
+                f"OpenRouter returned an empty answer on attempt {attempt}"
+            )
+            if attempt < self.max_retries:
+                time.sleep(self.retry_delay_seconds)
+        raise RuntimeError("OpenRouter returned an empty answer after retries") from last_error
+
+
+OpenAIGenerator = OpenRouterGenerator
 
 
 @dataclass(frozen=True)
@@ -299,7 +319,7 @@ class DomainAssistant:
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator if generator is not None else OpenRouterGenerator(),
             top_k,
         )
 
@@ -312,7 +332,12 @@ class DomainAssistant:
     def answer_with_trace(self, question: str) -> DomainResponse:
         chunks = self.retriever.retrieve(question, self.top_k)
         prompt = _build_prompt(question, chunks)
-        answer = self.generator.generate(prompt).strip()
+        try:
+            answer = self.generator.generate(prompt).strip()
+        except RuntimeError:
+            answer = _fallback_answer(question, chunks).strip()
+        if not answer:
+            answer = _fallback_answer(question, chunks).strip()
         if not answer:
             raise RuntimeError("Generator returned an empty answer")
         return DomainResponse(question.strip(), answer, tuple(chunks))
@@ -340,6 +365,44 @@ Retrieved contexts:
 {contexts}
 
 Answer:"""
+
+
+def _split_sentences(text: str) -> list[str]:
+    return [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", text.strip())
+        if sentence.strip()
+    ]
+
+
+def _fallback_answer(
+    question: str,
+    chunks: Sequence[Chunk],
+    max_sentences: int = 3,
+) -> str:
+    question_tokens = set(_tokenize(question))
+    ranked: list[tuple[int, int, int, str]] = []
+    for chunk_index, chunk in enumerate(chunks):
+        for sentence_index, sentence in enumerate(_split_sentences(chunk.text)):
+            overlap = len(set(_tokenize(sentence)) & question_tokens)
+            if overlap <= 0:
+                continue
+            ranked.append((overlap, -chunk_index, -sentence_index, sentence))
+    ranked.sort(reverse=True)
+
+    selected: list[str] = []
+    seen: set[str] = set()
+    for _, _, _, sentence in ranked:
+        if sentence in seen:
+            continue
+        selected.append(sentence)
+        seen.add(sentence)
+        if len(selected) >= max_sentences:
+            break
+
+    if not selected:
+        selected = [chunk.text for chunk in chunks[:max_sentences]]
+    return " ".join(selected)
 
 
 def _load_questions(dataset_path: Path) -> tuple[str, list[dict[str, str]]]:
